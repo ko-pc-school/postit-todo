@@ -9,6 +9,7 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
+  html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
   body { background: #EDEAE2; }
   * { box-sizing: border-box; }
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -279,6 +280,10 @@ function TokenGate({ onReady, onSelectLocal, catMode, onToggleCatMode }) {
   return (
     <div style={{
       minHeight: "100vh",
+      width: "100%",
+      maxWidth: "100%",
+      boxSizing: "border-box",
+      overflowX: "hidden",
       display: "flex",
       alignItems: "center",
       justifyContent: "center",
@@ -610,6 +615,10 @@ function PostItTodoistApp({ store, mode, onLogout, catMode, onToggleCatMode }) {
   return (
     <div style={{
       minHeight: "100vh",
+      width: "100%",
+      maxWidth: "100%",
+      boxSizing: "border-box",
+      overflowX: "hidden",
       background: "#EDEAE2",
       padding: "16px",
       fontFamily: "'Hiragino Sans', 'Yu Gothic', -apple-system, sans-serif",
