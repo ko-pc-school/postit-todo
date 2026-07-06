@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ポストイット ToDo🐾</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #EDEAE2; }
+  * { box-sizing: border-box; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // 新しいJSX自動変換(react/jsx-runtime への import 文)は
+  // 通常の<script>では使えずエラーになるため、
+  // 昔ながらの React.createElement 方式(classic runtime)に固定する
+  Babel.registerPreset('react-classic', {
+    presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+  });
+</script>
+<script type="text/babel" data-presets="react-classic">
+const { useState, useEffect, useCallback, useRef, useMemo } = React;
+
+// ---- 付箋カラー（きいろ・ぴんく・そら の3色） ----
+const COLORS = [
+  { name: "きいろ", bg: "#FFF6A9", fold: "#F0E27E" },
+  { name: "ぴんく", bg: "#FFDDE4", fold: "#F2BFCA" },
+  { name: "そら", bg: "#D8EAFF", fold: "#B8D4F2" },
+];
+
+const TOKEN_KEY = "postit-todoist-token-v1";
+const TOKEN_BACKUP_KEY = "postit-todoist-token-backup-v1";
+const ONBOARD_KEY = "postit-todoist-onboard-seen-v1";
+const STYLE_KEY = "postit-todoist-speech-style-v1";
+const MODE_KEY = "postit-todoist-mode-v1"; // "todoist" | "local"
+
+// catMode(ねこ言葉かどうか)に応じて、片方の文言を返す小さなヘルパー
+function tt(catMode, cat, normal) {
+  return catMode ? cat : normal;
+}
+const META_KEY = "postit-todoist-meta-v1";
+const CACHE_KEY = "postit-todoist-cache-v1";
+const ORDER_KEY = "postit-todoist-order-v1";
+const PROJECT_NAME = "ポストイット";
+const API_BASE = "https://api.todoist.com/api/v1";
+
+// ---- Todoist REST APIを直接呼ぶ ----
+async function todoistFetch(token, path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const body = await res.json();
+      msg = body.error || msg;
+    } catch {}
+    throw new Error(`Todoist APIエラー (${res.status}): ${msg}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+async function findProjectIds(token) {
+  const data = await todoistFetch(token, "/projects");
+  const list = data.results || data; // v1は{results:[...]}形式
+  const inbox = list.find((p) => p.inbox_project || p.is_inbox_project);
+  const custom = list.find((p) => p.name === PROJECT_NAME);
+  return { inboxId: inbox ? inbox.id : null, customId: custom ? custom.id : null };
+}
+
+async function fetchAllTasks(token) {
+  const { inboxId, customId } = await findProjectIds(token);
+  const ids = [inboxId, customId].filter(Boolean);
+  const seen = new Map();
+  for (const pid of ids) {
+    const data = await todoistFetch(token, `/tasks?project_id=${pid}`);
+    const list = data.results || data;
+    for (const t of list) {
+      if (!seen.has(t.id)) seen.set(t.id, { id: t.id, content: t.content });
+    }
+  }
+  return Array.from(seen.values());
+}
+
+async function createTask(token, content) {
+  const data = await todoistFetch(token, "/tasks", {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
+  return data.id;
+}
+
+async function updateTaskContent(token, id, content) {
+  await todoistFetch(token, `/tasks/${id}`, {
+    method: "POST",
+    body: JSON.stringify({ content }),
+  });
+}
+
+async function deleteTask(token, id) {
+  await todoistFetch(token, `/tasks/${id}`, { method: "DELETE" });
+}
+
+// ---- ローカルのみモード用のタスク保存(Todoistを一切使わない) ----
+const LOCAL_TASKS_KEY = "postit-todoist-local-tasks-v1";
+
+function genLocalId() {
+  return "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+// Todoist連携モード / ローカルのみモードのどちらでも同じ形({id, content})の
+// タスク一覧を扱えるように、共通のインターフェース(store)にまとめる
+function makeStore(mode, token) {
+  if (mode === "local") {
+    return {
+      async list() {
+        return loadJSON(LOCAL_TASKS_KEY, []);
+      },
+      async add(content) {
+        const list = loadJSON(LOCAL_TASKS_KEY, []);
+        const id = genLocalId();
+        list.push({ id, content });
+        saveJSON(LOCAL_TASKS_KEY, list);
+        return id;
+      },
+      async update(id, content) {
+        const list = loadJSON(LOCAL_TASKS_KEY, []);
+        const item = list.find((t) => t.id === id);
+        if (item) item.content = content;
+        saveJSON(LOCAL_TASKS_KEY, list);
+      },
+      async remove(id) {
+        const list = loadJSON(LOCAL_TASKS_KEY, []).filter((t) => t.id !== id);
+        saveJSON(LOCAL_TASKS_KEY, list);
+      },
+    };
+  }
+  return {
+    async list() {
+      return fetchAllTasks(token);
+    },
+    async add(content) {
+      return createTask(token, content);
+    },
+    async update(id, content) {
+      return updateTaskContent(token, id, content);
+    },
+    async remove(id) {
+      return deleteTask(token, id);
+    },
+  };
+}
+
+// ---- ローカル保存（付箋の色・回転・並び順・キャッシュ） ----
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+}
+
+function randRotation() {
+  return Math.round((Math.random() - 0.5) * 6);
+}
+
+function applyOrder(list) {
+  const order = loadJSON(ORDER_KEY, null);
+  if (!order) return list;
+  const idx = new Map(order.map((id, i) => [id, i]));
+  return [...list].sort((a, b) => {
+    const ai = idx.has(a.id) ? idx.get(a.id) : Infinity;
+    const bi = idx.has(b.id) ? idx.get(b.id) : Infinity;
+    return ai - bi;
+  });
+}
+
+function reorder(list, dragId, overId) {
+  const from = list.findIndex((t) => t.id === dragId);
+  const to = list.findIndex((t) => t.id === overId);
+  if (from === -1 || to === -1 || from === to) return list;
+  const next = [...list];
+  const [m] = next.splice(from, 1);
+  next.splice(to, 0, m);
+  return next;
+}
+
+function SpeechToggle({ catMode, onToggle }) {
+  return (
+    <div style={{ display: "inline-flex", border: "1px solid #D8D3C8", borderRadius: 8, overflow: "hidden" }}>
+      <button
+        onClick={() => !catMode && onToggle()}
+        style={{
+          border: "none", padding: "4px 8px", fontSize: 11, cursor: "pointer",
+          background: catMode ? "#3A3630" : "#fff", color: catMode ? "#fff" : "#3A3630",
+        }}
+      >
+        <span style={{ whiteSpace: "nowrap" }}>ねこ</span><wbr /><span style={{ whiteSpace: "nowrap" }}>言葉</span>
+      </button>
+      <button
+        onClick={() => catMode && onToggle()}
+        style={{
+          border: "none", padding: "4px 8px", fontSize: 11, cursor: "pointer",
+          background: !catMode ? "#3A3630" : "#fff", color: !catMode ? "#fff" : "#3A3630",
+        }}
+      >通常</button>
+    </div>
+  );
+}
+
+function TokenGate({ onReady, onSelectLocal, catMode, onToggleCatMode }) {
+  const [panel, setPanel] = useState("todoist"); // "todoist" | "local"
+  const [input, setInput] = useState("");
+  const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [backupToken] = useState(() => loadJSON(TOKEN_BACKUP_KEY, null));
+
+  async function restoreBackup() {
+    if (!backupToken) return;
+    setRestoring(true);
+    setError("");
+    try {
+      await todoistFetch(backupToken, "/projects");
+      saveJSON(TOKEN_KEY, backupToken);
+      onReady(backupToken);
+    } catch (e) {
+      setError(tt(catMode, "さっきのアカウントに戻れなかったにゃ: ", "さっきのアカウントに戻れませんでした: ") + e.message);
+    } finally {
+      setRestoring(false);
+    }
+  }
+
+  async function submit() {
+    // 見えない特殊文字(全角スペース・ゼロ幅文字・改行など)を除去してから
+    // 純粋な英数字トークンだけを取り出す(コピペ時の混入対策)
+    const raw = input.trim();
+    const token = raw.replace(/[\u200B-\u200D\uFEFF\u3000\s]/g, "");
+    if (!token) return;
+    if (/[^\x20-\x7E]/.test(token)) {
+      setError(tt(catMode,
+        "トークンに使えない文字が含まれてるにゃ。もう一度Todoistの検索欄で「連携機能」→「開発者」からコピーし直してほしいにゃ。",
+        "トークンに使えない文字が含まれています。もう一度Todoistの検索欄で「連携機能」→「開発者」からコピーし直してください。"
+      ));
+      return;
+    }
+    setChecking(true);
+    setError("");
+    try {
+      await todoistFetch(token, "/projects");
+      saveJSON(TOKEN_KEY, token);
+      onReady(token);
+    } catch (e) {
+      setError(tt(catMode, "トークンが正しくないか、通信に失敗したにゃ: ", "トークンが正しくないか、通信に失敗しました: ") + e.message);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontFamily: "'Hiragino Sans', 'Yu Gothic', -apple-system, sans-serif",
+      padding: 16,
+    }}>
+      <div style={{
+        background: "#fff",
+        borderRadius: 12,
+        padding: 24,
+        maxWidth: 360,
+        width: "100%",
+        boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <h2 style={{ margin: 0, fontSize: 16, color: "#3A3630" }}>
+            ポストイット ToDo{catMode ? "🐾" : ""}
+          </h2>
+          <SpeechToggle catMode={catMode} onToggle={onToggleCatMode} />
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          <button
+            onClick={() => setPanel("todoist")}
+            style={{
+              flex: 1, padding: "7px 6px", borderRadius: 8, fontSize: 12, cursor: "pointer",
+              border: panel === "todoist" ? "1px solid #3A3630" : "1px solid #D8D3C8",
+              background: panel === "todoist" ? "#3A3630" : "#fff",
+              color: panel === "todoist" ? "#fff" : "#3A3630",
+            }}
+          >Todoistと連携する</button>
+          <button
+            onClick={() => setPanel("local")}
+            style={{
+              flex: 1, padding: "7px 6px", borderRadius: 8, fontSize: 12, cursor: "pointer",
+              border: panel === "local" ? "1px solid #3A3630" : "1px solid #D8D3C8",
+              background: panel === "local" ? "#3A3630" : "#fff",
+              color: panel === "local" ? "#fff" : "#3A3630",
+            }}
+          >このブラウザだけで使う</button>
+        </div>
+
+        {panel === "todoist" ? (
+        <>
+        <p style={{ fontSize: 12.5, color: "#6b6558", lineHeight: 1.6 }}>
+          Todoistの個人APIトークンを入力してください。
+          トークンはこの端末のブラウザ内にのみ保存され、外部には送信されません。
+        </p>
+        <input
+          type="password"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder="Todoist APIトークン"
+          style={{
+            width: "100%",
+            padding: "8px 10px",
+            borderRadius: 8,
+            border: "1px solid #D8D3C8",
+            fontSize: 13,
+            marginTop: 8,
+          }}
+        />
+        <button
+          onClick={submit}
+          disabled={checking || !input.trim()}
+          style={{
+            marginTop: 10,
+            width: "100%",
+            padding: "8px 10px",
+            borderRadius: 8,
+            border: "none",
+            background: "#3A3630",
+            color: "#fff",
+            fontSize: 13,
+            cursor: checking ? "default" : "pointer",
+            opacity: checking || !input.trim() ? 0.5 : 1,
+          }}
+        >
+          {checking ? "確認中..." : "はじめる"}
+        </button>
+        {error && (
+          <div style={{ marginTop: 8, fontSize: 12, color: "#B4483C" }}>{error}</div>
+        )}
+        {backupToken && (
+          <button
+            onClick={restoreBackup}
+            disabled={restoring || checking}
+            style={{
+              marginTop: 10, width: "100%", padding: "7px 10px", borderRadius: 8,
+              border: "1px solid #D8D3C8", background: "#fff", color: "#3A3630",
+              fontSize: 12, cursor: restoring ? "default" : "pointer",
+              opacity: restoring ? 0.5 : 1,
+            }}
+          >{restoring ? "戻しています..." : "← さっきのアカウントに戻る"}</button>
+        )}
+        <p style={{ fontSize: 11, color: "#9a9488", marginTop: 12, lineHeight: 1.7 }}>
+          Todoist上部の<b>検索欄に「連携機能」</b>と入力し、出てきた「連携機能(Integrations)」→
+          「<b>開発者</b>」タブの中でAPIトークンを確認できます。
+          (設定メニューの中からは見つかりにくいことがあるので、検索から探すのが確実です)
+        </p>
+        </>
+        ) : (
+        <>
+        <p style={{ fontSize: 12.5, color: "#6b6558", lineHeight: 1.6 }}>
+          {tt(catMode,
+            "Todoistアカウントを使わずに、このブラウザの中だけでタスクを管理できるにゃ。他の端末とは同期されないので、あくまでこの端末専用のメモとして使ってほしいにゃ。",
+            "Todoistアカウントを使わずに、このブラウザの中だけでタスクを管理できます。他の端末とは同期されないので、あくまでこの端末専用のメモとしてご利用ください。"
+          )}
+        </p>
+        <button
+          onClick={onSelectLocal}
+          style={{
+            marginTop: 10,
+            width: "100%",
+            padding: "8px 10px",
+            borderRadius: 8,
+            border: "none",
+            background: "#3A3630",
+            color: "#fff",
+            fontSize: 13,
+            cursor: "pointer",
+          }}
+        >はじめる</button>
+        <p style={{ fontSize: 11, color: "#9a9488", marginTop: 12 }}>
+          {tt(catMode,
+            "後からでも「Todoistと連携する」に切り替えられるにゃ。",
+            "後からでも「Todoistと連携する」に切り替えられます。"
+          )}
+        </p>
+        </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PostItTodoistApp({ store, mode, onLogout, catMode, onToggleCatMode }) {
+  const [todos, setTodos] = useState(() => loadJSON(CACHE_KEY, []));
+  const [text, setText] = useState("");
+  const [colorIdx, setColorIdx] = useState(0);
+  const [loading, setLoading] = useState(() => loadJSON(CACHE_KEY, null) === null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [selectedId, setSelectedId] = useState(null);
+  const [draggingId, setDraggingId] = useState(null);
+  const [showHelp, setShowHelp] = useState(false);
+  const [showOnboard, setShowOnboard] = useState(() => !loadJSON(ONBOARD_KEY, false));
+
+  function dismissOnboard() {
+    saveJSON(ONBOARD_KEY, true);
+    setShowOnboard(false);
+  }
+
+  const drag = useRef(null);
+
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    setError("");
+    try {
+      const raw0 = await store.list();
+      const meta = loadJSON(META_KEY, { notes: {} });
+      let changed = false;
+      const raw = raw0.map((t) => {
+        if (!meta.notes[t.id]) {
+          meta.notes[t.id] = {
+            color: Math.floor(Math.random() * COLORS.length),
+            rotation: randRotation(),
+          };
+          changed = true;
+        }
+        return { ...t, ...meta.notes[t.id] };
+      });
+      if (changed) saveJSON(META_KEY, meta);
+      const list = applyOrder(raw);
+      setTodos(list);
+      saveJSON(CACHE_KEY, list);
+    } catch (e) {
+      setError(tt(catMode, "読み込みに失敗したにゃ: ", "読み込みに失敗しました: ") + e.message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [store]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  async function addTodo() {
+    if (busy) return;
+    const raw = text.trim();
+    // 空でも付箋を作れるように、空の時は仮の内容として半角スペース1文字を使う
+    const content = raw || " ";
+    setBusy(true);
+    setError("");
+    try {
+      const id = await store.add(content);
+      const meta = loadJSON(META_KEY, { notes: {} });
+      meta.notes[id] = { color: colorIdx, rotation: randRotation() };
+      saveJSON(META_KEY, meta);
+      setTodos((prev) => {
+        const next = [...prev, { id, content, ...meta.notes[id] }];
+        saveJSON(ORDER_KEY, next.map((t) => t.id));
+        saveJSON(CACHE_KEY, next);
+        return next;
+      });
+      setText("");
+      if (!raw) {
+        // 空の付箋はそのまま編集状態にして、すぐに書き込めるようにする
+        setEditingId(id);
+        setEditText("");
+      }
+    } catch (e) {
+      setError(tt(catMode, "追加に失敗したにゃ: ", "追加に失敗しました: ") + e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeTodo(id) {
+    setBusy(true);
+    setError("");
+    try {
+      await store.remove(id);
+      const meta = loadJSON(META_KEY, { notes: {} });
+      delete meta.notes[id];
+      saveJSON(META_KEY, meta);
+      setTodos((prev) => {
+        const next = prev.filter((t) => t.id !== id);
+        saveJSON(ORDER_KEY, next.map((t) => t.id));
+        saveJSON(CACHE_KEY, next);
+        return next;
+      });
+    } catch (e) {
+      setError(tt(catMode, "削除に失敗したにゃ: ", "削除に失敗しました: ") + e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function pickColor(i) {
+    setColorIdx(i);
+    if (selectedId) {
+      const meta = loadJSON(META_KEY, { notes: {} });
+      meta.notes[selectedId] = {
+        ...(meta.notes[selectedId] || { rotation: randRotation() }),
+        color: i,
+      };
+      saveJSON(META_KEY, meta);
+      setTodos((prev) => prev.map((t) => (t.id === selectedId ? { ...t, color: i } : t)));
+    }
+  }
+
+  function startEdit(t) {
+    setEditingId(t.id);
+    setEditText(t.content);
+  }
+
+  async function saveEdit(id) {
+    // 空にして保存した場合も、仮の内容として半角スペース1文字で保存する
+    const content = editText.trim() || " ";
+    setBusy(true);
+    setError("");
+    try {
+      await store.update(id, content);
+      setTodos((prev) => {
+        const next = prev.map((t) => (t.id === id ? { ...t, content } : t));
+        saveJSON(CACHE_KEY, next);
+        return next;
+      });
+      setEditingId(null);
+    } catch (e) {
+      setError(tt(catMode, "編集に失敗したにゃ: ", "編集に失敗しました: ") + e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onPointerDown(e, id) {
+    if (editingId === id) return;
+    const start = { id, startX: e.clientX, startY: e.clientY, active: false };
+    drag.current = start;
+
+    const move = (ev) => {
+      const d = drag.current;
+      if (!d) return;
+      if (!d.active) {
+        if (Math.abs(ev.clientX - d.startX) + Math.abs(ev.clientY - d.startY) > 6) {
+          d.active = true;
+          setDraggingId(d.id);
+        } else {
+          return;
+        }
+      }
+      const target = document.elementFromPoint(ev.clientX, ev.clientY);
+      const noteEl = target && target.closest ? target.closest("[data-note-id]") : null;
+      if (!noteEl) return;
+      const overId = noteEl.getAttribute("data-note-id");
+      if (overId && overId !== d.id) {
+        setTodos((prev) => reorder(prev, d.id, overId));
+      }
+    };
+
+    const up = () => {
+      const d = drag.current;
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      drag.current = null;
+      setDraggingId(null);
+      if (!d) return;
+      if (d.active) {
+        setTodos((prev) => {
+          saveJSON(ORDER_KEY, prev.map((t) => t.id));
+          saveJSON(CACHE_KEY, prev);
+          return prev;
+        });
+      } else {
+        setSelectedId((s) => (s === d.id ? null : d.id));
+      }
+    };
+
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#EDEAE2",
+      padding: "16px",
+      fontFamily: "'Hiragino Sans', 'Yu Gothic', -apple-system, sans-serif",
+    }}>
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", rowGap: 8 }}>
+          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: "#3A3630", letterSpacing: "0.02em" }}>
+            ポストイット ToDo{catMode ? "🐾" : ""}
+          </h2>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", rowGap: 8 }}>
+            <SpeechToggle catMode={catMode} onToggle={onToggleCatMode} />
+            <div style={{ width: 1, height: 18, background: "#D8D3C8", margin: "0 2px" }} />
+            <button
+              onClick={refresh}
+              disabled={refreshing}
+              title="タスクを更新"
+              style={{
+                border: "1px solid #D8D3C8", background: "#fff", borderRadius: 6,
+                cursor: refreshing ? "default" : "pointer",
+                fontSize: 15, opacity: refreshing ? 0.4 : 0.85, padding: "4px 8px",
+                display: "inline-flex", alignItems: "center", gap: 4,
+                animation: "none",
+              }}
+            ><span style={{ display: "inline-block", animation: refreshing ? "spin 0.8s linear infinite" : "none" }}>⟳</span></button>
+            <button
+              onClick={() => setShowHelp(true)}
+              title="使い方"
+              style={{
+                border: "1px solid #D8D3C8", background: "#fff", color: "#3A3630",
+                borderRadius: "50%", cursor: "pointer", fontSize: 12, fontWeight: 700,
+                width: 26, height: 26, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                padding: 0,
+              }}
+            >?</button>
+            <div style={{ width: 1, height: 18, background: "#D8D3C8", margin: "0 2px" }} />
+            <button
+              onClick={() => {
+                const msg = mode === "local"
+                  ? tt(catMode,
+                      "Todoistと連携する画面に切り替えますか?\n(今のローカルタスクはこの端末に残ったままになるにゃ)",
+                      "Todoistと連携する画面に切り替えますか?\n(今のローカルタスクはこの端末に残ったままになります)"
+                    )
+                  : tt(catMode,
+                      "別のTodoistアカウントに切り替えますか?\n(このパソコンに保存中のAPIトークンを削除して、トークン入力画面に戻るにゃ。Todoist本体のタスクは削除されません。次の画面の「さっきのアカウントに戻る」ボタンでいつでも元に戻せるにゃ)",
+                      "別のTodoistアカウントに切り替えますか?\n(このパソコンに保存中のAPIトークンを削除して、トークン入力画面に戻ります。Todoist本体のタスクは削除されません。次の画面の「さっきのアカウントに戻る」ボタンでいつでも元に戻せます)"
+                    );
+                if (window.confirm(msg)) {
+                  onLogout();
+                }
+              }}
+              title={mode === "local" ? "Todoistと連携する" : "別のTodoistアカウントに切り替える"}
+              style={{
+                border: "1px solid #D8D3C8", background: "#fff", color: "#6b6558",
+                borderRadius: 6, cursor: "pointer", fontSize: 11, padding: "4px 8px",
+              }}
+            >{mode === "local"
+                ? "Todoistと連携する"
+                : (<><span style={{ whiteSpace: "nowrap" }}>アカウント</span><wbr /><span style={{ whiteSpace: "nowrap" }}>変更</span></>)
+              }</button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+          {COLORS.map((c, i) => (
+            <button
+              key={c.name}
+              onClick={() => pickColor(i)}
+              title={c.name}
+              style={{
+                width: 20, height: 20, borderRadius: "50%", background: c.bg,
+                border: colorIdx === i ? "2px solid #3A3630" : "2px solid transparent",
+                cursor: "pointer", padding: 0,
+              }}
+            />
+          ))}
+        </div>
+        <div style={{ fontSize: 11, color: "#8A8478", marginBottom: 8 }}>
+          {selectedId
+            ? tt(catMode, "選択中の付箋の色を変えられるにゃ（もう一度タップで解除）", "選択中の付箋の色を変えられます（もう一度タップで解除）")
+            : tt(catMode, "付箋はドラッグで並べ替え、タップで選ぶと色を変えられるにゃ", "付箋はドラッグで並べ替え、タップで選ぶと色を変えられます")}
+        </div>
+
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addTodo()}
+            placeholder="新しいタスクを入力..."
+            disabled={busy}
+            style={{
+              flex: 1, padding: "8px 10px", borderRadius: 8,
+              border: "1px solid #D8D3C8", fontSize: 13, outline: "none", background: "#fff",
+            }}
+          />
+          <button
+            onClick={addTodo}
+            disabled={busy}
+            style={{
+              padding: "8px 14px", borderRadius: 8, border: "none",
+              background: "#3A3630", color: "#fff", fontSize: 13,
+              cursor: busy ? "default" : "pointer",
+              opacity: busy ? 0.5 : 1,
+            }}
+          >追加</button>
+        </div>
+
+        {error && <div style={{ marginTop: 8, fontSize: 12, color: "#B4483C" }}>{error}</div>}
+      </div>
+
+      {loading ? (
+        <div style={{ textAlign: "center", padding: 30, color: "#8A8478" }}>読み込み中...</div>
+      ) : todos.length === 0 ? (
+        <div style={{ textAlign: "center", padding: 30, color: "#8A8478", fontSize: 13 }}>{tt(catMode, "タスクはないにゃ", "タスクはありません")}</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: 12 }}>
+          {todos.map((t) => {
+            const c = COLORS[t.color] || COLORS[0];
+            const isDragging = draggingId === t.id;
+            return (
+              <div
+                key={t.id}
+                data-note-id={t.id}
+                onPointerDown={(e) => onPointerDown(e, t.id)}
+                style={{
+                  background: c.bg, borderRadius: "2px", padding: "10px 10px 38px",
+                  minHeight: 90, position: "relative", touchAction: "none",
+                  transform: isDragging ? "scale(1.06)" : `rotate(${t.rotation ?? 0}deg)`,
+                  boxShadow: isDragging
+                    ? "0 10px 20px rgba(0,0,0,0.28)"
+                    : selectedId === t.id
+                    ? "0 0 0 2px #3A3630, 0 3px 6px rgba(0,0,0,0.15)"
+                    : "0 3px 6px rgba(0,0,0,0.15)",
+                  transition: isDragging ? "transform 0.08s, box-shadow 0.08s" : "transform 0.15s, box-shadow 0.15s",
+                  cursor: isDragging ? "grabbing" : "grab",
+                  zIndex: isDragging ? 10 : 1,
+                  opacity: isDragging ? 0.92 : 1,
+                  pointerEvents: isDragging ? "none" : "auto",
+                  userSelect: "none",
+                }}
+              >
+                <div style={{
+                  position: "absolute", top: 0, right: 0, width: 14, height: 14,
+                  background: c.fold, clipPath: "polygon(100% 0, 0 0, 100% 100%)",
+                }} />
+                <button
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); startEdit(t); }}
+                  title="編集"
+                  style={{
+                    position: "absolute", top: 2, right: 16, border: "none",
+                    background: "transparent", cursor: "pointer", fontSize: 11, opacity: 0.5, padding: 2,
+                  }}
+                >✎</button>
+
+                {editingId === t.id ? (
+                  <div onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()}>
+                    <textarea
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      autoFocus
+                      style={{
+                        width: "100%", fontSize: 12.5, border: "none",
+                        background: "rgba(255,255,255,0.6)", borderRadius: 4, padding: 4,
+                        resize: "none", minHeight: 50, fontFamily: "inherit",
+                        color: "#3A3630", boxSizing: "border-box",
+                      }}
+                    />
+                    <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                      <button
+                        onClick={() => saveEdit(t.id)}
+                        style={{ fontSize: 11, border: "none", background: "#3A3630", color: "#fff", borderRadius: 4, padding: "2px 8px", cursor: "pointer" }}
+                      >保存</button>
+                      <button
+                        onClick={() => setEditingId(null)}
+                        style={{ fontSize: 11, border: "none", background: "transparent", color: "#6b6558", padding: "2px 8px", cursor: "pointer" }}
+                      >取消</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 12.5, color: "#3A3630", lineHeight: 1.4, wordBreak: "break-word", marginTop: 10 }}>
+                    {t.content}
+                  </div>
+                )}
+
+                <div style={{ position: "absolute", bottom: 2, right: 4, display: "flex", gap: 2 }}>
+                  <button
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => { e.stopPropagation(); removeTodo(t.id); }}
+                    disabled={busy}
+                    title="削除"
+                    style={{
+                      border: "none", background: "transparent", cursor: "pointer",
+                      fontSize: 12, fontWeight: "bold", color: "rgba(58,54,48,0.25)",
+                      width: 32, height: 32, display: "flex", alignItems: "center",
+                      justifyContent: "center", padding: 0,
+                    }}
+                  >×</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showHelp && (
+        <div
+          onClick={() => setShowHelp(false)}
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 16, zIndex: 100,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#fff", borderRadius: 12, padding: 20, maxWidth: 380,
+              width: "100%", boxShadow: "0 8px 24px rgba(0,0,0,0.2)",
+              fontFamily: "'Hiragino Sans', 'Yu Gothic', -apple-system, sans-serif",
+            }}
+          >
+            <h3 style={{ margin: "0 0 10px", fontSize: 15, color: "#3A3630" }}>使い方</h3>
+            <ul style={{ margin: 0, padding: "0 0 0 18px", fontSize: 12.5, color: "#3A3630", lineHeight: 1.9 }}>
+              <li>付箋は<b>ドラッグで並べ替え</b>{tt(catMode, "できるにゃ", "できます")}</li>
+              <li>付箋を<b>タップで選ぶと色</b>{tt(catMode, "を変えられるにゃ", "を変えられます")}</li>
+              <li>✎ アイコンで<b>内容を編集</b>、× で<b>削除</b>{tt(catMode, "できるにゃ", "できます")}</li>
+              <li><b>⟳(更新)</b>を押すとTodoistの最新状態を{tt(catMode, "取得するにゃ", "取得します")}</li>
+              <li><b>「アカウント変更」</b>は、別のTodoistアカウントを使いたい時だけ押すボタン{tt(catMode, "にゃ。普段は押さなくて大丈夫にゃ", "です。普段は押さなくて大丈夫です")}</li>
+              <li>タスクはTodoist本体とちゃんと同期されてるので、他のTodoistアプリから{tt(catMode, "も見えるにゃ", "も見えます")}</li>
+            </ul>
+            <button
+              onClick={() => setShowHelp(false)}
+              style={{
+                marginTop: 16, width: "100%", padding: "8px 10px", borderRadius: 8,
+                border: "none", background: "#3A3630", color: "#fff", fontSize: 13, cursor: "pointer",
+              }}
+            >{tt(catMode, "わかった", "わかりました")}</button>
+          </div>
+        </div>
+      )}
+
+      {showOnboard && (
+        <div
+          style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 16, zIndex: 100,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff", borderRadius: 12, padding: 20, maxWidth: 380,
+              width: "100%", boxShadow: "0 8px 24px rgba(0,0,0,0.2)",
+              fontFamily: "'Hiragino Sans', 'Yu Gothic', -apple-system, sans-serif",
+            }}
+          >
+            <h3 style={{ margin: "0 0 10px", fontSize: 15, color: "#3A3630" }}>
+              ようこそ、ポストイット ToDo{catMode ? "🐾" : ""}へ
+            </h3>
+            <p style={{ fontSize: 12.5, color: "#3A3630", lineHeight: 1.8, margin: "0 0 8px" }}>
+              {tt(catMode,
+                "上の入力欄からタスクを追加すると、Todoistの「Inbox」または「ポストイット」プロジェクトに保存されるにゃ。",
+                "上の入力欄からタスクを追加すると、Todoistの「Inbox」または「ポストイット」プロジェクトに保存されます。"
+              )}
+            </p>
+            <p style={{ fontSize: 12.5, color: "#3A3630", lineHeight: 1.8, margin: "0 0 8px" }}>
+              {tt(catMode,
+                "付箋はドラッグで並べ替え、タップで色を変えられるにゃ。困ったら右上の「?」ボタンでいつでも使い方を見られるにゃ。",
+                "付箋はドラッグで並べ替え、タップで色を変えられます。困ったら右上の「?」ボタンでいつでも使い方を見られます。"
+              )}
+            </p>
+            <p style={{ fontSize: 11.5, color: "#8A8478", lineHeight: 1.8, margin: "0 0 16px" }}>
+              {tt(catMode,
+                "※右上の「アカウント変更」は、他のTodoistアカウントに切り替える時だけ使うボタンにゃ。普段は押さなくて大丈夫にゃ。",
+                "※右上の「アカウント変更」は、他のTodoistアカウントに切り替える時だけ使うボタンです。普段は押さなくて大丈夫です。"
+              )}
+            </p>
+            <button
+              onClick={dismissOnboard}
+              style={{
+                width: "100%", padding: "8px 10px", borderRadius: 8,
+                border: "none", background: "#3A3630", color: "#fff", fontSize: 13, cursor: "pointer",
+              }}
+            >はじめる</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Root() {
+  const [token, setToken] = useState(() => loadJSON(TOKEN_KEY, null));
+  const [mode, setMode] = useState(() => loadJSON(MODE_KEY, null)); // "todoist" | "local" | null
+  const [catMode, setCatMode] = useState(() => loadJSON(STYLE_KEY, true));
+
+  const localStore = useMemo(() => makeStore("local"), []);
+  const todoistStore = useMemo(() => makeStore("todoist", token), [token]);
+
+  useEffect(() => {
+    document.title = catMode ? "ポストイット ToDo🐾" : "ポストイット ToDo";
+  }, [catMode]);
+
+  function toggleCatMode() {
+    setCatMode((prev) => {
+      const next = !prev;
+      saveJSON(STYLE_KEY, next);
+      return next;
+    });
+  }
+
+  function backToGate() {
+    if (mode === "todoist" && token) {
+      saveJSON(TOKEN_BACKUP_KEY, token);
+      localStorage.removeItem(TOKEN_KEY);
+    }
+    localStorage.removeItem(MODE_KEY);
+    setToken(null);
+    setMode(null);
+  }
+
+  if (mode === "local") {
+    return (
+      <PostItTodoistApp
+        store={localStore}
+        mode="local"
+        catMode={catMode}
+        onToggleCatMode={toggleCatMode}
+        onLogout={backToGate}
+      />
+    );
+  }
+
+  if (!token) {
+    return (
+      <TokenGate
+        onReady={(t) => {
+          saveJSON(MODE_KEY, "todoist");
+          setMode("todoist");
+          setToken(t);
+        }}
+        onSelectLocal={() => {
+          saveJSON(MODE_KEY, "local");
+          setMode("local");
+        }}
+        catMode={catMode}
+        onToggleCatMode={toggleCatMode}
+      />
+    );
+  }
+  return (
+    <PostItTodoistApp
+      store={todoistStore}
+      mode="todoist"
+      catMode={catMode}
+      onToggleCatMode={toggleCatMode}
+      onLogout={backToGate}
+    />
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
+</script>
+</body>
+</html>
