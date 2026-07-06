@@ -478,8 +478,9 @@ function PostItTodoistApp({ store, mode, onLogout, catMode, onToggleCatMode }) {
   async function addTodo() {
     if (busy) return;
     const raw = text.trim();
-    // 空でも付箋を作れるように、空の時は仮の内容として半角スペース1文字を使う
-    const content = raw || " ";
+    // 空でも付箋を作れるように、空の時は仮の内容としてゼロ幅スペースを使う
+    // (半角スペースだとTodoist側が「空」とみなして拒否することがあるため)
+    const content = raw || "\u200B";
     setBusy(true);
     setError("");
     try {
@@ -546,8 +547,8 @@ function PostItTodoistApp({ store, mode, onLogout, catMode, onToggleCatMode }) {
   }
 
   async function saveEdit(id) {
-    // 空にして保存した場合も、仮の内容として半角スペース1文字で保存する
-    const content = editText.trim() || " ";
+    // 空にして保存した場合も、仮の内容としてゼロ幅スペースで保存する
+    const content = editText.trim() || "\u200B";
     setBusy(true);
     setError("");
     try {
