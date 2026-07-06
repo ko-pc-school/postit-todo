@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <title>ポストイット ToDo🐾</title>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -798,7 +798,13 @@ function PostItTodoistApp({ store, mode, onLogout, catMode, onToggleCatMode }) {
                     </div>
                   </div>
                 ) : (
-                  <div style={{ fontSize: 12.5, color: "#3A3630", lineHeight: 1.4, wordBreak: "break-word", marginTop: 10 }}>
+                  <div
+                    onDoubleClick={(e) => { e.stopPropagation(); startEdit(t); }}
+                    style={{
+                      fontSize: 12.5, color: "#3A3630", lineHeight: 1.4, wordBreak: "break-word",
+                      marginTop: 10, cursor: "text", minHeight: 40,
+                    }}
+                  >
                     {t.content}
                   </div>
                 )}
